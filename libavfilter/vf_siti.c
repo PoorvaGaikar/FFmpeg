@@ -13,6 +13,7 @@
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
  * Lesser General Public License for more details.
+
  *
  * You should have received a copy of the GNU Lesser General Public
  * License along with FFmpeg; if not, write to the Free Software
@@ -25,6 +26,7 @@
  */
 
 #include <math.h>
+#include <float.h>
 
 #include "libavutil/imgutils.h"
 #include "libavutil/internal.h"
@@ -34,6 +36,15 @@
 #include "avfilter.h"
 #include "internal.h"
 #include "video.h"
+
+// Define normalization parameters
+#define MIN_SIGNAL 0.0  // Minimum signal level (black level)
+#define MAX_SIGNAL_8BIT 255.0  // Maximum signal level for 8-bit (white level)
+#define MAX_SIGNAL_10BIT 1023.0  // Maximum signal level for 10-bit (white level)
+#define FULL_RANGE_MIN 16.0  // Full range minimum (black level)
+#define FULL_RANGE_MAX 235.0  // Full range maximum (white level)
+#define SCALE_FACTOR 1.16438356  // Scale factor for 8-bit
+#define SCALE_FACTOR_10 1.16780822  // Scale factor for 10-bit
 
 static const int X_FILTER[9] = {
     1, 0, -1,
@@ -78,6 +89,8 @@ static av_cold int init(AVFilterContext *ctx)
     SiTiContext *s = ctx->priv;
     s->max_si = 0;
     s->max_ti = 0;
+    s->min_si = FLT_MAX;
+    s->min_ti = FLT_MAX;
     return 0;
 }
 
@@ -134,7 +147,7 @@ static int config_input(AVFilterLink *inlink)
     motion_sz = s->width * sizeof(float) * s->height;
     s->motion_matrix = av_malloc(motion_sz);
 
-    if (!s->prev_frame || ! s->gradient_matrix || !s->motion_matrix) {
+    if (!s->prev_frame || !s->gradient_matrix || !s->motion_matrix) {
         return AVERROR(ENOMEM);
     }
 
@@ -212,8 +225,7 @@ static void convolve_sobel(SiTiContext *s, const uint8_t *src, float *dst, int l
 }
 
 // Calculate pixel difference between current and previous frame, and update previous
-static void calculate_motion(SiTiContext *s, const uint8_t *curr,
-                             float *motion_matrix, int linesize)
+static void calculate_motion(SiTiContext *s, const uint8_t *curr, float *motion_matrix, int linesize)
 {
     int stride = linesize / s->pixel_depth;
     float motion;
@@ -271,6 +283,19 @@ static float std_deviation(float *img_metrics, int width, int height)
     return sqrt(sqr_diff);
 }
 
+static float mean(float *img_metrics, int width, int height)
+{
+    int size = height * width;
+    double sum = 0.0;
+
+    for (int j = 0; j < height; j++){
+        for (int i = 0; i < width; i++){
+            sum += img_metrics[j * width + i];
+        }
+    }
+    return sum / size;
+}
+
 static void set_meta(AVDictionary **metadata, const char *key, float d)
 {
     char value[128];
@@ -278,8 +303,53 @@ static void set_meta(AVDictionary **metadata, const char *key, float d)
     av_dict_set(metadata, key, value, 0);
 }
 
-static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
-{
+static void normalize_luma(uint8_t *data, int width, int height, int linesize, int bit_depth, int full_range) {
+    int max_val = (1 << bit_depth) - 1;
+    int stride ;
+
+    // Print any one pixel's normalized and scaled value from each frame
+    int print_x = width / 2;
+    int print_y = height / 2;
+
+    if (bit_depth == 8) {
+        stride = linesize / sizeof(uint8_t);
+        for (int j = 0; j < height; j++) {
+            for (int i = 0; i < width; i++) {
+                float normalized_value = data[j * stride + i] / (float)max_val;
+                float scaled_value = normalized_value;
+                // Apply range scaling if the range is limited
+                if (!full_range) {
+                    scaled_value = (normalized_value - 16.0 / 255.0) * SCALE_FACTOR;
+                }
+                if (j == print_y && i == print_x) {
+                    av_log(NULL, AV_LOG_INFO, "Normalized value (8-bit): %f\n", normalized_value);
+                    av_log(NULL, AV_LOG_INFO, "Scaled value (8-bit): %f\n", scaled_value);
+                }
+                data[j * stride + i] = scaled_value;
+            }
+        }
+    } else {
+        stride = linesize / sizeof(uint16_t);
+        uint16_t *data16 = (uint16_t *)data;
+        for (int j = 0; j < height; j++) {
+            for (int i = 0; i < width; i++) {
+                float normalized_value = data16[j * stride + i] / (float)max_val;
+                float scaled_value = normalized_value;
+                // Apply range scaling if the range is limited
+                if (!full_range) {
+                    scaled_value = (normalized_value - 64.0 / 1023.0) * SCALE_FACTOR_10;
+                }
+                if (j == print_y && i == print_x) {
+                    av_log(NULL, AV_LOG_INFO, "Normalized value (8-bit): %f\n", normalized_value);
+                    av_log(NULL, AV_LOG_INFO, "Scaled value (8-bit): %f\n", scaled_value);
+                }
+                data16[j * stride + i] = scaled_value;
+            }
+        }
+    }
+}
+
+static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
     AVFilterContext *ctx = inlink->dst;
     SiTiContext *s = ctx->priv;
     float si;
@@ -287,6 +357,9 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
 
     s->full_range = is_full_range(frame);
     s->nb_frames++;
+
+    // Normalize luma values and print them
+    normalize_luma(frame->data[0], s->width, s->height, frame->linesize[0], s->pixel_depth * 8, s->full_range);
 
     // Calculate si and ti
     convolve_sobel(s, frame->data[0], s->gradient_matrix, frame->linesize[0]);
@@ -324,6 +397,7 @@ static const AVFilterPad avfilter_vf_siti_inputs[] = {
         .name         = "default",
         .type         = AVMEDIA_TYPE_VIDEO,
         .config_props = config_input,
+
         .filter_frame = filter_frame,
     },
 };
