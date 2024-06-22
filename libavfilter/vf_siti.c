@@ -13,7 +13,6 @@
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
  * Lesser General Public License for more details.
-
  *
  * You should have received a copy of the GNU Lesser General Public
  * License along with FFmpeg; if not, write to the Free Software
@@ -24,6 +23,7 @@
  * @file
  * Calculate Spatial Info (SI) and Temporal Info (TI) scores
  */
+
 
 #include <math.h>
 #include <float.h>
@@ -303,9 +303,65 @@ static void set_meta(AVDictionary **metadata, const char *key, float d)
     av_dict_set(metadata, key, value, 0);
 }
 
-static void normalize_luma(uint8_t *data, int width, int height, int linesize, int bit_depth, int full_range) {
+// Define EOTF functions for SDR, HLG, and PQ
+static float apply_bt2100_eotf(float signal) {
+    if (signal <= 0.5) {
+        return pow(signal / 4.5, 2.4);
+    } else {
+        float a = 0.17883277;
+        float b = 0.28466892;
+        float c = 0.55991073;
+        return pow((signal - c) / (a * 4.5 + b), 1.0 / 2.4);
+    }
+}
+
+static float apply_sdr_eotf(float signal) {
+    // ITU-R BT.1886 EOTF
+    float gamma = 2.4;
+    return pow(signal, gamma);
+}
+
+static float apply_hlg_eotf(float signal) {
+    // HLG EOTF as per BT.2100
+    if (signal <= 1.0 / 12.0) {
+        return sqrt(3.0 * signal);
+    } else {
+        float a = 0.17883277;
+        float b = 0.28466892;
+        float c = 1.0 - a - b;
+        return a * log(12.0 * signal - b) + c;
+    }
+}
+
+static float apply_pq_eotf(float signal) {
+    // PQ EOTF as per ST 2084
+    const float m1 = 0.1593017578125;
+    const float m2 = 79.279296875;
+    const float c1 = 0.8359375;
+    const float c2 = 18.87451171875;
+    const float c3 = 18.703125;
+
+    float x = pow(signal, m1);
+    return pow(fmax(0.0, c1 + c2 * x) / (1.0 + c3 * x), m2);
+}
+
+// Function to apply the appropriate EOTF based on the domain
+static float apply_eotf(float signal, int domain) {
+    switch (domain) {
+        case 0: // SDR
+            return apply_sdr_eotf(signal);
+        case 1: // HLG
+            return apply_hlg_eotf(signal);
+        case 2: // PQ
+            return apply_pq_eotf(signal);
+        default:
+            return signal; // If no domain is specified, return the original signal
+    }
+}
+// Normalize luma values and then apply EOTF
+static void normalize_and_apply_eotf(uint8_t *data, int width, int height, int linesize, int bit_depth, int full_range, int domain) {
     int max_val = (1 << bit_depth) - 1;
-    int stride ;
+    int stride;
 
     // Print any one pixel's normalized and scaled value from each frame
     int print_x = width / 2;
@@ -316,16 +372,15 @@ static void normalize_luma(uint8_t *data, int width, int height, int linesize, i
         for (int j = 0; j < height; j++) {
             for (int i = 0; i < width; i++) {
                 float normalized_value = data[j * stride + i] / (float)max_val;
-                float scaled_value = normalized_value;
-                // Apply range scaling if the range is limited
                 if (!full_range) {
-                    scaled_value = (normalized_value - 16.0 / 255.0) * SCALE_FACTOR;
+                    normalized_value = (normalized_value - 16.0 / 255.0) * SCALE_FACTOR;
                 }
+                float linear_light_value = apply_eotf(normalized_value, domain);
                 if (j == print_y && i == print_x) {
                     av_log(NULL, AV_LOG_INFO, "Normalized value (8-bit): %f\n", normalized_value);
-                    av_log(NULL, AV_LOG_INFO, "Scaled value (8-bit): %f\n", scaled_value);
+                    av_log(NULL, AV_LOG_INFO, "Linear light value (8-bit): %f\n", linear_light_value);
                 }
-                data[j * stride + i] = scaled_value;
+                data[j * stride + i] = linear_light_value * max_val; // scale back to original range
             }
         }
     } else {
@@ -334,21 +389,21 @@ static void normalize_luma(uint8_t *data, int width, int height, int linesize, i
         for (int j = 0; j < height; j++) {
             for (int i = 0; i < width; i++) {
                 float normalized_value = data16[j * stride + i] / (float)max_val;
-                float scaled_value = normalized_value;
-                // Apply range scaling if the range is limited
                 if (!full_range) {
-                    scaled_value = (normalized_value - 64.0 / 1023.0) * SCALE_FACTOR_10;
+                    normalized_value = (normalized_value - 64.0 / 1023.0) * SCALE_FACTOR_10;
                 }
+                float linear_light_value = apply_eotf(normalized_value, domain);
                 if (j == print_y && i == print_x) {
-                    av_log(NULL, AV_LOG_INFO, "Normalized value (8-bit): %f\n", normalized_value);
-                    av_log(NULL, AV_LOG_INFO, "Scaled value (8-bit): %f\n", scaled_value);
+                    av_log(NULL, AV_LOG_INFO, "Normalized value (10-bit): %f\n", normalized_value);
+                    av_log(NULL, AV_LOG_INFO, "Linear light value (10-bit): %f\n", linear_light_value);
                 }
-                data16[j * stride + i] = scaled_value;
+                data16[j * stride + i] = linear_light_value * max_val; // scale back to original range
             }
         }
     }
 }
 
+// Update filter_frame to include domain parameter for EOTF
 static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
     AVFilterContext *ctx = inlink->dst;
     SiTiContext *s = ctx->priv;
@@ -358,10 +413,11 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
     s->full_range = is_full_range(frame);
     s->nb_frames++;
 
-    // Normalize luma values and print them
-    normalize_luma(frame->data[0], s->width, s->height, frame->linesize[0], s->pixel_depth * 8, s->full_range);
+    // Normalize luma values and then apply EOTF
+    int domain = 0; // Change this as needed (0 for SDR, 1 for HLG, 2 for PQ)
+    normalize_and_apply_eotf(frame->data[0], s->width, s->height, frame->linesize[0], s->pixel_depth * 8, s->full_range, domain);
 
-    // Calculate si and ti
+    // Calculate SI and TI
     convolve_sobel(s, frame->data[0], s->gradient_matrix, frame->linesize[0]);
     calculate_motion(s, frame->data[0], s->motion_matrix, frame->linesize[0]);
     si = std_deviation(s->gradient_matrix, s->width - 2, s->height - 2);
@@ -375,12 +431,13 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
     s->min_si  = s->nb_frames == 1 ? si : fminf(si, s->min_si);
     s->min_ti  = s->nb_frames == 1 ? ti : fminf(ti, s->min_ti);
 
-    // Set si ti information in frame metadata
+    // Set SI TI information in frame metadata
     set_meta(&frame->metadata, "lavfi.siti.si", si);
     set_meta(&frame->metadata, "lavfi.siti.ti", ti);
 
     return ff_filter_frame(inlink->dst->outputs[0], frame);
 }
+
 
 #define OFFSET(x) offsetof(SiTiContext, x)
 #define FLAGS AV_OPT_FLAG_VIDEO_PARAM|AV_OPT_FLAG_FILTERING_PARAM
