@@ -1,3 +1,4 @@
+
 /*
  * Copyright (c) 2021 Boris Baracaldo
  * Copyright (c) 2022 Thilo Borgmann
@@ -23,7 +24,6 @@
  * @file
  * Calculate Spatial Info (SI) and Temporal Info (TI) scores
  */
-
 
 #include <math.h>
 #include <float.h>
@@ -358,10 +358,31 @@ static float apply_eotf(float signal, int domain) {
             return signal; // If no domain is specified, return the original signal
     }
 }
-// Normalize luma values and then apply EOTF
-static void normalize_and_apply_eotf(uint8_t *data, int width, int height, int linesize, int bit_depth, int full_range, int domain) {
+
+// Function to apply PQ OETF as defined in ITU-R Rec. BT.2100
+static float apply_pq_oetf(float signal) {
+    const float m = 78.84375;
+    const float n = 0.1593017578125;
+    const float c1 = 0.8359375;
+    const float c2 = 18.8515625;
+    const float c3 = 18.6875;
+    const float lm1 = powf(10000.0, n);
+    
+    // Compute lm2
+    float lm2 = powf(signal, n);
+
+    // Apply the PQ OETF formula
+    float encoded_value = powf((c1 * lm1 + c2 * lm2) / (lm1 + c3 * lm2), m);
+
+    return encoded_value;
+}
+
+// Normalize luma values, apply EOTF, scale luminance, and apply OETF
+static void normalize_apply_eotf_scale_oetf(uint8_t *data, int width, int height, int linesize, int bit_depth, int full_range, int domain) {
     int max_val = (1 << bit_depth) - 1;
     int stride;
+    float L_min = 0.1;  // Example minimum luminance of the display
+    float L_max = 300.0;  // Example maximum luminance of the display
 
     // Print any one pixel's normalized and scaled value from each frame
     int print_x = width / 2;
@@ -376,11 +397,16 @@ static void normalize_and_apply_eotf(uint8_t *data, int width, int height, int l
                     normalized_value = (normalized_value - 16.0 / 255.0) * SCALE_FACTOR;
                 }
                 float linear_light_value = apply_eotf(normalized_value, domain);
+                // Scale luminance to the display range
+                float scaled_value = L_min + (linear_light_value * (L_max - L_min));
+                float encoded_value = apply_pq_oetf(scaled_value);
                 if (j == print_y && i == print_x) {
                     av_log(NULL, AV_LOG_INFO, "Normalized value (8-bit): %f\n", normalized_value);
                     av_log(NULL, AV_LOG_INFO, "Linear light value (8-bit): %f\n", linear_light_value);
+                    av_log(NULL, AV_LOG_INFO, "Scaled value (8-bit): %f\n", scaled_value);
+                    av_log(NULL, AV_LOG_INFO, "Encoded value (8-bit): %f\n", encoded_value);
                 }
-                data[j * stride + i] = linear_light_value * max_val; // scale back to original range
+                data[j * stride + i] = encoded_value * max_val; // scale back to original range
             }
         }
     } else {
@@ -393,17 +419,22 @@ static void normalize_and_apply_eotf(uint8_t *data, int width, int height, int l
                     normalized_value = (normalized_value - 64.0 / 1023.0) * SCALE_FACTOR_10;
                 }
                 float linear_light_value = apply_eotf(normalized_value, domain);
+                // Scale luminance to the display range
+                float scaled_value = L_min + (linear_light_value * (L_max - L_min));
+                float encoded_value = apply_pq_oetf(scaled_value);
                 if (j == print_y && i == print_x) {
                     av_log(NULL, AV_LOG_INFO, "Normalized value (10-bit): %f\n", normalized_value);
                     av_log(NULL, AV_LOG_INFO, "Linear light value (10-bit): %f\n", linear_light_value);
+                    av_log(NULL, AV_LOG_INFO, "Scaled value (10-bit): %f\n", scaled_value);
+                    av_log(NULL, AV_LOG_INFO, "Encoded value (10-bit): %f\n", encoded_value);
                 }
-                data16[j * stride + i] = linear_light_value * max_val; // scale back to original range
+                data16[j * stride + i] = encoded_value * max_val; // scale back to original range
             }
         }
     }
 }
 
-// Update filter_frame to include domain parameter for EOTF
+// Update filter_frame to include domain parameter for EOTF and OETF
 static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
     AVFilterContext *ctx = inlink->dst;
     SiTiContext *s = ctx->priv;
@@ -413,9 +444,9 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
     s->full_range = is_full_range(frame);
     s->nb_frames++;
 
-    // Normalize luma values and then apply EOTF
+    // Normalize luma values, apply EOTF, scale luminance, and apply OETF
     int domain = 0; // Change this as needed (0 for SDR, 1 for HLG, 2 for PQ)
-    normalize_and_apply_eotf(frame->data[0], s->width, s->height, frame->linesize[0], s->pixel_depth * 8, s->full_range, domain);
+    normalize_apply_eotf_scale_oetf(frame->data[0], s->width, s->height, frame->linesize[0], s->pixel_depth * 8, s->full_range, domain);
 
     // Calculate SI and TI
     convolve_sobel(s, frame->data[0], s->gradient_matrix, frame->linesize[0]);
@@ -437,7 +468,6 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
 
     return ff_filter_frame(inlink->dst->outputs[0], frame);
 }
-
 
 #define OFFSET(x) offsetof(SiTiContext, x)
 #define FLAGS AV_OPT_FLAG_VIDEO_PARAM|AV_OPT_FLAG_FILTERING_PARAM
