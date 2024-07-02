@@ -118,7 +118,7 @@ static av_cold void uninit(AVFilterContext *ctx)
 
 static int config_input(AVFilterLink *inlink)
 {
-    // Video input data available
+    // Video input data avilable
     AVFilterContext *ctx = inlink->dst;
     SiTiContext *s = ctx->priv;
     int max_pixsteps[4];
@@ -131,7 +131,7 @@ static int config_input(AVFilterLink *inlink)
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(inlink->format);
     av_image_fill_max_pixsteps(max_pixsteps, NULL, desc);
 
-    // Free previous buffers in case they are allocated already
+    // free previous buffers in case they are allocated already
     av_freep(&s->prev_frame);
     av_freep(&s->gradient_matrix);
     av_freep(&s->motion_matrix);
@@ -192,9 +192,13 @@ static float normalize_to_original_si_range(float si_value) {
 
 // Applies sobel convolution
 static void convolve_sobel(SiTiContext *s, float *src, float *dst, int linesize) {
-    double x_conv_sum, y_conv_sum;
+    double x_conv_sum;
+    double y_conv_sum;
     float gradient;
-    int ki, kj, index;
+    int ki;
+    int kj;
+    int index;
+    uint16_t data;
     int filter_width = 3;
     int filter_size = filter_width * filter_width;
     int stride = linesize / s->pixel_depth;
@@ -236,7 +240,8 @@ static void convolve_sobel(SiTiContext *s, float *src, float *dst, int linesize)
 
 
 // Calculate pixel difference between current and previous frame, and update previous
-static void calculate_motion(SiTiContext *s, const uint8_t *curr, float *motion_matrix, int linesize)
+static void calculate_motion(SiTiContext *s, const uint8_t *curr,
+                             float *motion_matrix, int linesize)
 {
     int stride = linesize / s->pixel_depth;
     float motion;
@@ -432,7 +437,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
     int domain = 0; // Change this as needed (0 for SDR, 1 for HLG, 2 for PQ)
     normalize_apply_eotf_scale_oetf(frame->data[0], s->oetf_data, s->width, s->height, frame->linesize[0], s->pixel_depth * 8, s->full_range, domain);
 
-    // Calculate SI and TI
+    // Calculate si and ti
     convolve_sobel(s, s->oetf_data, s->gradient_matrix, frame->linesize[0]);
     calculate_motion(s, frame->data[0], s->motion_matrix, frame->linesize[0]);
     si = std_deviation(s->gradient_matrix, s->width - 2, s->height - 2);
@@ -450,7 +455,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
     s->min_si  = s->nb_frames == 1 ? si : fminf(si, s->min_si);
     s->min_ti  = s->nb_frames == 1 ? ti : fminf(ti, s->min_ti);
 
-    // Set SI TI information in frame metadata
+    // Set si ti information in frame metadata
     set_meta(&frame->metadata, "lavfi.siti.si", si);
     set_meta(&frame->metadata, "lavfi.siti.ti", ti);
 
