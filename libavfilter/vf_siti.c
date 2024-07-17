@@ -63,7 +63,44 @@ typedef struct SiTiContext {
     float *motion_matrix;
     int full_range;
     int print_summary;
+    int hdr_mode;
+    int bit_depth;
+    int color_range;
+    int eotf_function;
+    int calculation_domain;
+    float l_max;
+    float l_min;
+    float gamma;
+    int pu21_mode;
 } SiTiContext;
+
+enum HdrMode {
+    SDR,
+    HDR10,
+    HLG
+};
+
+enum ColorRange {
+    LIMITED,
+    FULL
+};
+
+enum EotfFunction {
+    BT1886,
+    INV_SRGB
+};
+
+enum CalculationDomain {
+    PQ,
+    PU21
+};
+
+enum Pu21Mode {
+    BANDING,
+    BANDING_GLARE,
+    PEAKS,
+    PEAKS_GLARE
+};
 
 static const enum AVPixelFormat pix_fmts[] = {
     AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV422P,
@@ -73,11 +110,20 @@ static const enum AVPixelFormat pix_fmts[] = {
 };
 
 static av_cold int init(AVFilterContext *ctx)
-{
+{  
     // User options but no input data
     SiTiContext *s = ctx->priv;
     s->max_si = 0;
     s->max_ti = 0;
+    s->hdr_mode = SDR;
+    s->bit_depth = 8;
+    s->color_range = LIMITED;
+    s->eotf_function = BT1886;
+    s->calculation_domain = PQ;
+    s->l_max = 300.0;
+    s->l_min = 0.1;
+    s->gamma = 2.4;
+    s->pu21_mode = BANDING;
     return 0;
 }
 
@@ -114,7 +160,7 @@ static int config_input(AVFilterLink *inlink)
 
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(inlink->format);
     av_image_fill_max_pixsteps(max_pixsteps, NULL, desc);
-
+    
     // free previous buffers in case they are allocated already
     av_freep(&s->prev_frame);
     av_freep(&s->gradient_matrix);
@@ -134,7 +180,7 @@ static int config_input(AVFilterLink *inlink)
     motion_sz = s->width * sizeof(float) * s->height;
     s->motion_matrix = av_malloc(motion_sz);
 
-    if (!s->prev_frame || ! s->gradient_matrix || !s->motion_matrix) {
+    if (!s->prev_frame || !s->gradient_matrix || !s->motion_matrix) {
         return AVERROR(ENOMEM);
     }
 
@@ -164,6 +210,81 @@ static uint16_t convert_full_range(int factor, uint16_t y)
     full_upper = 256 * factor - 1;
     limit_y = fminf(fmaxf(y - shift, 0), limit_upper);
     return (full_upper * limit_y / limit_upper);
+}
+
+static float eotf_1886(float x, float gamma, float l_min, float l_max)
+{
+    float a = powf(powf(l_max, 1.0f / gamma) - powf(l_min, 1.0f / gamma), gamma);
+    float b = powf(l_min, 1.0f / gamma) / (powf(l_max, 1.0f / gamma) - powf(l_min, 1.0f / gamma));
+    return a * powf(fmaxf(x + b, 0), gamma);
+}
+
+static float eotf_inv_srgb(float x)
+{
+    return (x <= 0.04045f) ? x / 12.92f : powf((x + 0.055f) / 1.055f, 2.4f);
+}
+
+static float apply_display_model(SiTiContext *s, float x)
+{
+    if (s->eotf_function == BT1886) {
+        return eotf_1886(x, s->gamma, 0.0f, 1.0f);
+    } else {
+        return eotf_inv_srgb(x);
+    }
+}
+
+static float oetf_pq(float x)
+{
+    const float m1 = 0.1593017578125f;
+    const float m2 = 78.84375f;
+    const float c1 = 0.8359375f;
+    const float c2 = 18.8515625f;
+    const float c3 = 18.6875f;
+
+    float y = powf(x / 10000.0f, m1);
+    return powf((c1 + c2 * y) / (1.0f + c3 * y), m2);
+}
+
+static float oetf_pu21(float x, int mode)
+{
+    float p[7];
+    float p_min, p_max;
+
+    switch (mode) {
+        case BANDING:
+            p[0] = 1.070275272f; p[1] = 0.4088273932f; p[2] = 0.153224308f;
+            p[3] = 0.2520326168f; p[4] = 1.063512885f; p[5] = 1.14115047f;
+            p[6] = 521.4527484f;
+            p_min = -1.5580e-07f;
+            p_max = 520.4673f;
+            break;
+        case BANDING_GLARE:
+            p[0] = 0.353487901f; p[1] = 0.3734658629f; p[2] = 8.277049286e-05f;
+            p[3] = 0.9062562627f; p[4] = 0.09150303166f; p[5] = 0.9099517204f;
+            p[6] = 596.3148142f;
+            p_min = 5.4705e-10f;
+            p_max = 595.3939f;
+            break;
+        case PEAKS:
+            p[0] = 1.043882782f; p[1] = 0.6459495343f; p[2] = 0.3194584211f;
+            p[3] = 0.374025247f; p[4] = 1.114783422f; p[5] = 1.095360363f;
+            p[6] = 384.9217577f;
+            p_min = 1.3674e-07f;
+            p_max = 380.9853f;
+            break;
+        case PEAKS_GLARE:
+            p[0] = 816.885024f; p[1] = 1479.463946f; p[2] = 0.001253215609f;
+            p[3] = 0.9329636822f; p[4] = 0.06746643971f; p[5] = 1.573435413f;
+            p[6] = 419.6006374f;
+            p_min = -9.7360e-08f;
+            p_max = 407.5066f;
+            break;
+        default:
+            return x;
+    }
+
+    float y = p[6] * (powf((p[0] + p[1] * powf(x, p[3])) / (1.0f + p[2] * powf(x, p[3])), p[4]) - p[5]);
+    return (y - p_min) / (p_max - p_min);
 }
 
 // Applies sobel convolution
@@ -285,14 +406,45 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
     float si;
     float ti;
 
-    s->full_range = is_full_range(frame);
+    s->full_range = is_full_range(frame); // Determine if full range is needed
     s->nb_frames++;
+
+    // Apply EOTF and OETF transformations
+    for (int i = 0; i < s->width * s->height; i++) {
+        float pixel = ((uint8_t*)frame->data[0])[i] / 255.0f;
+        float eotf = apply_display_model(s, pixel);
+        float oetf = oetf_pq(eotf * s->l_max);
+        ((uint8_t*)frame->data[0])[i] = (uint8_t)(oetf * 255.0f);
+    }
 
     // Calculate si and ti
     convolve_sobel(s, frame->data[0], s->gradient_matrix, frame->linesize[0]);
     calculate_motion(s, frame->data[0], s->motion_matrix, frame->linesize[0]);
     si = std_deviation(s->gradient_matrix, s->width - 2, s->height - 2);
     ti = std_deviation(s->motion_matrix, s->width, s->height);
+
+    // Apply HDR transformations if necessary
+    if (s->hdr_mode != SDR) {
+        float (*oetf_func)(float);
+        if (s->calculation_domain == PQ) {
+            oetf_func = oetf_pq;
+        } else {
+            oetf_func = oetf_pu21;
+        }
+
+        for (int i = 0; i < (s->width - 2) * (s->height - 2); i++) {
+            s->gradient_matrix[i] = oetf_func(apply_display_model(s, s->gradient_matrix[i] / 255.0f)) * 255.0f;
+        }
+        for (int i = 0; i < s->width * s->height; i++) {
+            s->motion_matrix[i] = oetf_func(apply_display_model(s, s->motion_matrix[i] / 255.0f)) * 255.0f;
+        }
+
+        si = std_deviation(s->gradient_matrix, s->width - 2, s->height - 2);
+        ti = std_deviation(s->motion_matrix, s->width, s->height);
+    }
+
+    // Print SI and TI values for each frame
+    av_log(ctx, AV_LOG_INFO, "Frame %"PRId64" - SI: %.6f, TI: %.6f\n", s->nb_frames, si, ti);
 
     // Calculate statistics
     s->max_si  = fmaxf(si, s->max_si);
@@ -314,6 +466,15 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
 
 static const AVOption siti_options[] = {
     { "print_summary", "Print summary showing average values", OFFSET(print_summary), AV_OPT_TYPE_BOOL, { .i64=0 }, 0, 1, FLAGS },
+    { "hdr_mode", "HDR mode (0: SDR, 1: HDR10, 2: HLG)", OFFSET(hdr_mode), AV_OPT_TYPE_INT, {.i64=0}, 0, 2, FLAGS },
+    { "bit_depth", "Bit depth (8, 10, or 12)", OFFSET(bit_depth), AV_OPT_TYPE_INT, {.i64=8}, 8, 12, FLAGS },
+    { "color_range", "Color range (0: limited, 1: full)", OFFSET(color_range), AV_OPT_TYPE_INT, {.i64=0}, 0, 1, FLAGS },
+    { "eotf_function", "EOTF function (0: BT.1886, 1: Inverse sRGB)", OFFSET(eotf_function), AV_OPT_TYPE_INT, {.i64=0}, 0, 1, FLAGS },
+    { "calculation_domain", "Calculation domain (0: PQ, 1: PU21)", OFFSET(calculation_domain), AV_OPT_TYPE_INT, {.i64=0}, 0, 1, FLAGS },
+    { "l_max", "Maximum luminance", OFFSET(l_max), AV_OPT_TYPE_FLOAT, {.dbl=300.0}, 0, 10000, FLAGS },
+    { "l_min", "Minimum luminance", OFFSET(l_min), AV_OPT_TYPE_FLOAT, {.dbl=0.1}, 0, 1, FLAGS },
+    { "gamma", "Gamma value for BT.1886", OFFSET(gamma), AV_OPT_TYPE_FLOAT, {.dbl=2.4}, 1, 3, FLAGS },
+    { "pu21_mode", "PU21 mode (0: BANDING, 1: BANDING_GLARE, 2: PEAKS, 3: PEAKS_GLARE)", OFFSET(pu21_mode), AV_OPT_TYPE_INT, {.i64=0}, 0, 3, FLAGS },
     { NULL }
 };
 
