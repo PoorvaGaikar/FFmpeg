@@ -47,6 +47,16 @@ static const int Y_FILTER[9] = {
     -1, -2, -1
 };
 
+static const float PU21_MATRICES[4][7] = {
+    {1.070275272f, 0.4088273932f, 0.153224308f, 0.2520326168f, 1.063512885f, 1.14115047f, 521.4527484f},  // BANDING
+    {0.353487901f, 0.3734658629f, 8.277049286e-05f, 0.9062562627f, 0.09150303166f, 0.9099517204f, 596.3148142f},  // BANDING_GLARE
+    {1.043882782f, 0.6459495343f, 0.3194584211f, 0.374025247f, 1.114783422f, 1.095360363f, 384.9217577f},  // PEAKS
+    {816.885024f, 1479.463946f, 0.001253215609f, 0.9329636822f, 0.06746643971f, 1.573435413f, 419.6006374f}  // PEAKS_GLARE
+};
+
+static const float PU21_MIN_VALUES[4] = {-1.5580e-07f, 5.4705e-10f, 1.3674e-07f, -9.7360e-08f};
+static const float PU21_MAX_VALUES[4] = {520.4673f, 595.3939f, 380.9853f, 407.5066f};
+
 typedef struct SiTiContext {
     const AVClass *class;
     int pixel_depth;
@@ -149,7 +159,7 @@ static av_cold void uninit(AVFilterContext *ctx)
 
 static int config_input(AVFilterLink *inlink)
 {
-    // Video input data avilable
+    // Video input data available
     AVFilterContext *ctx = inlink->dst;
     SiTiContext *s = ctx->priv;
     int max_pixsteps[4];
@@ -161,7 +171,7 @@ static int config_input(AVFilterLink *inlink)
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(inlink->format);
     av_image_fill_max_pixsteps(max_pixsteps, NULL, desc);
     
-    // free previous buffers in case they are allocated already
+    // Free previous buffers in case they are allocated already
     av_freep(&s->prev_frame);
     av_freep(&s->gradient_matrix);
     av_freep(&s->motion_matrix);
@@ -212,29 +222,49 @@ static uint16_t convert_full_range(int factor, uint16_t y)
     return (full_upper * limit_y / limit_upper);
 }
 
+// EOTF for BT.1886
 static float eotf_1886(float x, float gamma, float l_min, float l_max)
 {
-    float a = powf(powf(l_max, 1.0f / gamma) - powf(l_min, 1.0f / gamma), gamma);
-    float b = powf(l_min, 1.0f / gamma) / (powf(l_max, 1.0f / gamma) - powf(l_min, 1.0f / gamma));
-    return a * powf(fmaxf(x + b, 0), gamma);
+    // Reference: ITU-R BT.1886, Annex 1
+    // https://www.itu.int/dms_pubrec/itu-r/rec/bt/R-REC-BT.1886-0-201103-I!!PDF-E.pdf
+    const float l_max_gamma = powf(l_max, 1.0f / gamma);
+    const float l_min_gamma = powf(l_min, 1.0f / gamma);
+    const float l_diff_gamma = l_max_gamma - l_min_gamma;
+    const float a = powf(l_diff_gamma, gamma);
+    const float b = l_min_gamma / l_diff_gamma;
+    const float adjusted_x = fmaxf(x + b, 0.0f);
+
+    return a * powf(adjusted_x, gamma);
 }
 
 static float eotf_inv_srgb(float x)
 {
+    // Inverse sRGB EOTF (Electro-Optical Transfer Function) according to IEC 61966-2-1:1999
+    // Section G.2 (Encoding transformation)
+    // Reference: https://cdn.standards.iteh.ai/samples/10795/ae461684569b40bbbb2d9a22b1047f05/IEC-61966-2-1-1999-AMD1-2003.pdf
     return (x <= 0.04045f) ? x / 12.92f : powf((x + 0.055f) / 1.055f, 2.4f);
 }
 
 static float apply_display_model(SiTiContext *s, float x)
 {
+    // Apply either BT.1886 or inverse sRGB EOTF based on the context
     if (s->eotf_function == BT1886) {
+        // BT.1886 EOTF
+        // Reference: ITU-R BT.1886-0, Annex 1
+        // https://www.itu.int/dms_pubrec/itu-r/rec/bt/R-REC-BT.1886-0-201103-I!!PDF-E.pdf
         return eotf_1886(x, s->gamma, 0.0f, 1.0f);
     } else {
+        // Inverse sRGB EOTF
         return eotf_inv_srgb(x);
     }
 }
 
 static float oetf_pq(float x)
 {
+    // PQ (Perceptual Quantizer) OETF according to ITU-R BT.2100-2
+    // Reference: https://www.itu.int/dms_pubrec/itu-r/rec/bt/R-REC-BT.2100-2-201807-I!!PDF-E.pdf
+    // See page 5, Table 4
+
     const float m1 = 0.1593017578125f;
     const float m2 = 78.84375f;
     const float c1 = 0.8359375f;
@@ -245,46 +275,53 @@ static float oetf_pq(float x)
     return powf((c1 + c2 * y) / (1.0f + c3 * y), m2);
 }
 
+// Function declaration
+static float oetf_pu21(float x, int mode);
+
+// Wrapper function
+static float oetf_pu21_wrapper(float x) {
+    int mode = 0; // Set the appropriate mode or pass it as a parameter
+    return oetf_pu21(x, mode);
+}
+
+// Main function definition
 static float oetf_pu21(float x, int mode)
 {
-    float p[7];
-    float p_min, p_max;
-
-    switch (mode) {
-        case BANDING:
-            p[0] = 1.070275272f; p[1] = 0.4088273932f; p[2] = 0.153224308f;
-            p[3] = 0.2520326168f; p[4] = 1.063512885f; p[5] = 1.14115047f;
-            p[6] = 521.4527484f;
-            p_min = -1.5580e-07f;
-            p_max = 520.4673f;
-            break;
-        case BANDING_GLARE:
-            p[0] = 0.353487901f; p[1] = 0.3734658629f; p[2] = 8.277049286e-05f;
-            p[3] = 0.9062562627f; p[4] = 0.09150303166f; p[5] = 0.9099517204f;
-            p[6] = 596.3148142f;
-            p_min = 5.4705e-10f;
-            p_max = 595.3939f;
-            break;
-        case PEAKS:
-            p[0] = 1.043882782f; p[1] = 0.6459495343f; p[2] = 0.3194584211f;
-            p[3] = 0.374025247f; p[4] = 1.114783422f; p[5] = 1.095360363f;
-            p[6] = 384.9217577f;
-            p_min = 1.3674e-07f;
-            p_max = 380.9853f;
-            break;
-        case PEAKS_GLARE:
-            p[0] = 816.885024f; p[1] = 1479.463946f; p[2] = 0.001253215609f;
-            p[3] = 0.9329636822f; p[4] = 0.06746643971f; p[5] = 1.573435413f;
-            p[6] = 419.6006374f;
-            p_min = -9.7360e-08f;
-            p_max = 407.5066f;
-            break;
-        default:
-            return x;
+    // Reference: "PU21: A novel perceptually uniform encoding for adapting existing quality metrics for HDR"
+    // Rafał K. Mantiuk and M. Azimi, Picture Coding Symposium 2021
+    // https://github.com/gfxdisp/pu21
+    // Validate the mode
+    const float *p;
+    float p_min;
+    float p_max;
+    float numerator;
+    float denominator;
+    float base;
+    float exponentiated;
+    float scaled;
+    
+    if (mode < 0 || mode > 3) {
+        return x;  // Invalid mode, return input unchanged
     }
 
-    float y = p[6] * (powf((p[0] + p[1] * powf(x, p[3])) / (1.0f + p[2] * powf(x, p[3])), p[4]) - p[5]);
-    return (y - p_min) / (p_max - p_min);
+    // Get the parameters and min/max values for the given mode
+
+
+    p = PU21_MATRICES[mode];
+    p_min = PU21_MIN_VALUES[mode];
+    p_max = PU21_MAX_VALUES[mode];
+
+    // Declare all other variables at the beginning of the block
+    numerator = p[0] + p[1] * powf(x, p[3]);
+    denominator = 1.0f + p[2] * powf(x, p[3]);
+    base = numerator / denominator;
+
+    // Calculate the exponentiated and scaled value
+    exponentiated = powf(base, p[4]);
+    scaled = p[6] * (exponentiated - p[5]);
+
+    // Normalize the result to the range [0, 1]
+    return (scaled - p_min) / (p_max - p_min);
 }
 
 // Applies sobel convolution
@@ -375,15 +412,16 @@ static float std_deviation(float *img_metrics, int width, int height)
     int size = height * width;
     double mean = 0.0;
     double sqr_diff = 0;
+    int j, i;
 
-    for (int j = 0; j < height; j++)
-        for (int i = 0; i < width; i++)
+    for (j = 0; j < height; j++)
+        for (i = 0; i < width; i++)
             mean += img_metrics[j * width + i];
 
     mean /= size;
 
-    for (int j = 0; j < height; j++) {
-        for (int i = 0; i < width; i++) {
+    for (j = 0; j < height; j++) {
+        for (i = 0; i < width; i++) {
             float mean_diff = img_metrics[j * width + i] - mean;
             sqr_diff += (mean_diff * mean_diff);
         }
@@ -405,12 +443,13 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
     SiTiContext *s = ctx->priv;
     float si;
     float ti;
+    int i;
 
     s->full_range = is_full_range(frame); // Determine if full range is needed
     s->nb_frames++;
 
     // Apply EOTF and OETF transformations
-    for (int i = 0; i < s->width * s->height; i++) {
+    for (i = 0; i < s->width * s->height; i++) {
         float pixel = ((uint8_t*)frame->data[0])[i] / 255.0f;
         float eotf = apply_display_model(s, pixel);
         float oetf = oetf_pq(eotf * s->l_max);
@@ -429,13 +468,13 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
         if (s->calculation_domain == PQ) {
             oetf_func = oetf_pq;
         } else {
-            oetf_func = oetf_pu21;
+            oetf_func = oetf_pu21_wrapper;
         }
 
-        for (int i = 0; i < (s->width - 2) * (s->height - 2); i++) {
+        for (i = 0; i < (s->width - 2) * (s->height - 2); i++) {
             s->gradient_matrix[i] = oetf_func(apply_display_model(s, s->gradient_matrix[i] / 255.0f)) * 255.0f;
         }
-        for (int i = 0; i < s->width * s->height; i++) {
+        for (i = 0; i < s->width * s->height; i++) {
             s->motion_matrix[i] = oetf_func(apply_display_model(s, s->motion_matrix[i] / 255.0f)) * 255.0f;
         }
 
